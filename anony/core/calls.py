@@ -63,8 +63,9 @@ class TgCall(PyTgCalls):
                 logger.debug("Voice call cleanup for %s: %s", chat_id, type(exc).__name__)
 
     async def play_media(
-        self, chat_id: int, message: Message, media: Media | Track, seek_time: int = 0
-    ) -> None:
+        self, chat_id: int, message: Message, media: Media | Track,
+        seek_time: int = 0, advance_on_error: bool = True,
+    ) -> bool:
         client = await db.get_assistant(chat_id)
         _lang = await lang.get_lang(chat_id)
         _thumb = (
@@ -73,8 +74,9 @@ class TgCall(PyTgCalls):
 
         if not media.file_path:
             await message.edit_text(_lang["error_no_file"].format(config.SUPPORT_CHAT))
-            await self.play_next(chat_id)
-            return
+            if advance_on_error:
+                await self.play_next(chat_id)
+            return False
 
         stream = types.MediaStream(
             media_path=media.file_path,
@@ -94,9 +96,7 @@ class TgCall(PyTgCalls):
             if not seek_time:
                 media.time = max(1, media.time)
                 await db.add_call(chat_id)
-                text = _lang["play_media"].format(
-                    media.url, media.title, media.duration, media.user,
-                )
+                text = _lang["play_media"].format(media.url, media.title, media.duration, media.user)
                 keyboard = buttons.controls(chat_id)
                 try:
                     if _thumb:
@@ -116,21 +116,29 @@ class TgCall(PyTgCalls):
                             chat_id=chat_id, text=text, reply_markup=keyboard
                         )
                     media.message_id = sent.id
+            return True
         except FileNotFoundError:
             await message.edit_text(_lang["error_no_file"].format(config.SUPPORT_CHAT))
-            await self.play_next(chat_id)
+            if advance_on_error:
+                await self.play_next(chat_id)
+            return False
         except exceptions.NoActiveGroupCall:
             await self.stop(chat_id)
             await message.edit_text(_lang["error_no_call"])
+            return False
         except exceptions.NoAudioSourceFound:
             await message.edit_text(_lang["error_no_audio"])
-            await self.play_next(chat_id)
+            if advance_on_error:
+                await self.play_next(chat_id)
+            return False
         except (ConnectionError, ConnectionNotFound, TelegramServerError, TransportParseException, TimeoutError):
             await self.stop(chat_id)
             await message.edit_text(_lang["error_tg_server"])
+            return False
         except RTMPStreamingUnsupported:
             await self.stop(chat_id)
             await message.edit_text(_lang["error_rtmp"])
+            return False
         except Exception:
             logger.exception("Unexpected playback error in chat %s", chat_id)
             await self.stop(chat_id)
@@ -138,6 +146,7 @@ class TgCall(PyTgCalls):
                 await message.edit_text(_lang["error_tg_server"])
             except Exception:
                 pass
+            return False
 
     async def replay(self, chat_id: int) -> None:
         if not await db.get_call(chat_id):
@@ -152,8 +161,8 @@ class TgCall(PyTgCalls):
         await self.play_media(chat_id, msg, media)
 
     async def play_next(self, chat_id: int) -> None:
-        # This transition is iterative and bounded. It guards against a burst
-        # of duplicate StreamEnded and /skip events within this bot process.
+        # Serialize queue transitions but never recurse into play_next while
+        # holding the lock. Failed media starts continue in this bounded loop.
         async with self._lock_for(chat_id):
             for _attempt in range(config.PLAYBACK_SKIP_LIMIT):
                 loop = await db.get_loop(chat_id)
@@ -161,42 +170,42 @@ class TgCall(PyTgCalls):
                 if loop and current is not None:
                     await db.set_loop(chat_id, loop - 1)
                     media = current
-                    break
+                else:
+                    media = queue.get_next(chat_id)
+                    if media is None:
+                        await self.stop(chat_id)
+                        return
+                    old_message_id = getattr(media, "message_id", 0)
+                    if old_message_id:
+                        try:
+                            await app.delete_messages(chat_id=chat_id, message_ids=old_message_id, revoke=True)
+                        except Exception:
+                            pass
+                        media.message_id = 0
+                    if not media.file_path:
+                        try:
+                            media.file_path = await yt.download(media.id, video=media.video)
+                        except Exception:
+                            logger.exception("Track download raised in chat %s", chat_id)
+                            media.file_path = None
+                    if not media.file_path:
+                        logger.warning("Skipping unavailable track %s in chat %s", media.id, chat_id)
+                        continue
 
-                media = queue.get_next(chat_id)
-                if media is None:
-                    await self.stop(chat_id)
+                _lang = await lang.get_lang(chat_id)
+                msg = await app.send_message(chat_id=chat_id, text=_lang["play_next"])
+                media.message_id = msg.id
+                started = await self.play_media(
+                    chat_id, msg, media, advance_on_error=False
+                )
+                if started:
                     return
-
-                old_message_id = getattr(media, "message_id", 0)
-                if old_message_id:
-                    try:
-                        await app.delete_messages(
-                            chat_id=chat_id, message_ids=old_message_id, revoke=True
-                        )
-                    except Exception:
-                        pass
-                    media.message_id = 0
-
-                if media.file_path:
-                    break
-                try:
-                    media.file_path = await yt.download(media.id, video=media.video)
-                except Exception:
-                    logger.exception("Track download raised in chat %s", chat_id)
-                    media.file_path = None
-                if media.file_path:
-                    break
-                logger.warning("Skipping unavailable track %s in chat %s", media.id, chat_id)
-            else:
-                logger.error("Playback skip limit reached in chat %s; stopping queue", chat_id)
-                await self.stop(chat_id)
-                return
-
-            _lang = await lang.get_lang(chat_id)
-            msg = await app.send_message(chat_id=chat_id, text=_lang["play_next"])
-            media.message_id = msg.id
-            await self.play_media(chat_id, msg, media)
+                # Known recoverable audio/file errors can move to the next item;
+                # fatal call/transport errors clear active-call state in play_media.
+                if not await db.get_call(chat_id) and not queue.get_current(chat_id):
+                    return
+            logger.error("Playback skip limit reached in chat %s; stopping queue", chat_id)
+            await self.stop(chat_id)
 
     async def ping(self) -> float:
         pings = [client.ping for client in self.clients]
