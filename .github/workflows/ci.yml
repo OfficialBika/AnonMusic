@@ -21,8 +21,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
+      - name: Install system requirements for import-time checks
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg curl unzip
+          curl -fsSL https://deno.land/install.sh | sh
+          echo "$HOME/.deno/bin" >> "$GITHUB_PATH"
+      - uses: astral-sh/setup-uv@v5
       - name: Install locked dependencies
         run: uv sync --frozen
       - name: Compile Python source
