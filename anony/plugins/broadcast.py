@@ -1,70 +1,94 @@
-# Copyright (c) 2025 AnonymousX1025
-# Licensed under the MIT License.
-# This file is part of AnonXMusic
-
-
-import os
 import asyncio
+import os
+from collections import Counter
 
 from pyrogram import errors, filters, types
 
-from anony import app, db, lang
+from anony import app, config, db, lang, logger
 
 
 broadcasting = asyncio.Lock()
+
 
 @app.on_message(filters.command(["broadcast"]) & app.sudoers)
 @lang.language()
 async def _broadcast(_, message: types.Message):
     if not message.reply_to_message:
         return await message.reply_text(message.lang["gcast_usage"])
-
     if broadcasting.locked():
         return await message.reply_text(message.lang["gcast_active"])
 
     msg = message.reply_to_message
     copy = "-copy" in message.command
-    count, ucount = 0, 0
-    groups, users = set(), set()
+    groups = set() if "-nochat" in message.command else set(await db.get_chats())
+    users = set(await db.get_users()) if "-user" in message.command else set()
+    chats = sorted(groups | users)
+    counts = Counter()
+    failures = []
     sent = await message.reply_text(message.lang["gcast_start"])
-
-    if "-nochat" not in message.command:
-        groups = set(await db.get_chats())
-    if "-user" in message.command:
-        users = set(await db.get_users())
-
-    chats = list(groups | users)
-    failed = None
+    retry_limit = max(0, config.BROADCAST_RETRY_LIMIT)
+    progress_every = max(1, config.BROADCAST_PROGRESS_EVERY)
 
     async with broadcasting:
-        for chat in chats:
+        total = len(chats)
+        for index, chat in enumerate(chats, start=1):
+            delivered = False
+            for attempt in range(retry_limit + 1):
+                try:
+                    if copy:
+                        await msg.copy(chat, reply_markup=msg.reply_markup)
+                    else:
+                        await msg.forward(chat)
+                    counts["group" if chat in groups else "user"] += 1
+                    delivered = True
+                    break
+                except errors.FloodWait as fw:
+                    if attempt >= retry_limit:
+                        failures.append((chat, f"FloodWait exhausted after {fw.value}s"))
+                        break
+                    await asyncio.sleep(fw.value + 1)
+                except (errors.ChatWriteForbidden, errors.UserIsBlocked, errors.PeerIdInvalid) as exc:
+                    failures.append((chat, type(exc).__name__))
+                    if config.BROADCAST_AUTO_LEAVE and chat in groups:
+                        try:
+                            await app.leave_chat(chat)
+                            counts["auto_left"] += 1
+                        except Exception:
+                            logger.warning("Could not leave blocked group %s", chat)
+                    break
+                except Exception as exc:
+                    failures.append((chat, type(exc).__name__))
+                    logger.warning("Broadcast failed for %s: %s", chat, type(exc).__name__)
+                    break
+
+            if not delivered:
+                counts["failed"] += 1
+            if index % progress_every == 0 or index == total:
+                try:
+                    await sent.edit_text(
+                        f"{message.lang['gcast_start']}\nProgress: {index}/{total}\n"
+                        f"Groups: {counts['group']} | Users: {counts['user']}\n"
+                        f"Failed: {counts['failed']}"
+                    )
+                except Exception:
+                    pass
+            await asyncio.sleep(0.2)
+
+    report_lines = [f"chat_id={chat} error={reason}" for chat, reason in failures]
+    if report_lines:
+        report_path = "broadcast_errors.txt"
+        try:
+            with open(report_path, "w", encoding="utf-8") as fp:
+                fp.write("\n".join(report_lines))
+            await message.reply_document(
+                report_path, caption=f"Failed destinations: {len(failures)}"
+            )
+        finally:
             try:
-                (
-                    await msg.copy(chat, reply_markup=msg.reply_markup)
-                    if copy
-                    else await msg.forward(chat)
-                )
-                if chat in groups:
-                    count += 1
-                else:
-                    ucount += 1
-                await asyncio.sleep(0.2)
-            except errors.FloodWait as fw:
-                await asyncio.sleep(fw.value + 10)
-            except Exception as ex:
-                if not failed:
-                    failed = open("errors.txt", "w")
-                failed.write(f"{chat} - {ex}\n")
-                continue
+                os.remove(report_path)
+            except OSError:
+                pass
 
-    text = message.lang["gcast_end"].format(count, ucount)
-    if failed:
-        failed.close()
-        await message.reply_document(
-            document="errors.txt",
-            caption=text,
-        )
-        try: os.remove("errors.txt")
-        except Exception: pass
-
-    await sent.edit_text(text)
+    final = message.lang["gcast_end"].format(counts["group"], counts["user"])
+    final += f"\nFailed: {counts['failed']} | Auto-left: {counts['auto_left']}"
+    await sent.edit_text(final)
