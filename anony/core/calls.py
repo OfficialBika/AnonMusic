@@ -200,10 +200,11 @@ class TgCall(PyTgCalls):
                 )
                 if started:
                     return
-                # Known recoverable audio/file errors can move to the next item;
-                # fatal call/transport errors clear active-call state in play_media.
-                if not await db.get_call(chat_id) and not queue.get_current(chat_id):
-                    return
+                # The track failed before a call was established; move to the next queued item.
+                # Fatal call/transport errors may already have cleared the queue.
+                if not await db.get_call(chat_id):
+                    if queue.get_current(chat_id) is None:
+                        return
             logger.error("Playback skip limit reached in chat %s; stopping queue", chat_id)
             await self.stop(chat_id)
 
